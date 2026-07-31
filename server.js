@@ -4,7 +4,7 @@ const path = require('path');
 
 const app = express();
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'publique')));
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
@@ -44,9 +44,6 @@ function loadLocalData() {
   return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 }
 
-// Au démarrage : on essaie d'abord de récupérer les données depuis JSONbin
-// (survit à un redéploiement ou un changement de machine), sinon on se
-// rabat sur le fichier local.
 async function loadData() {
   if (JSONBIN_ID && JSONBIN_KEY) {
     try {
@@ -81,7 +78,6 @@ function maybeDailyBackup() {
   }
 }
 
-// Garde les 30 dernières sauvegardes quotidiennes locales, supprime le reste.
 function cleanupOldBackups() {
   try {
     const files = fs.readdirSync(DATA_DIR)
@@ -108,8 +104,6 @@ async function syncToJsonBin() {
   }
 }
 
-// Écriture locale immédiate (rapide, ne bloque pas la réponse) + copie vers
-// JSONbin en arrière-plan + une sauvegarde datée locale une fois par jour.
 function saveData() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -135,11 +129,6 @@ function genCode() {
   return code;
 }
 
-// Facturation :
-// 1-70 min -> 1h pleine due
-// 71-130 min -> 2h pleines dues
-// 131-190 min -> 3h dues, remise de 20%
-// > 190 min -> tarif journalier de la salle
 function computeBilling(startISO, endISO, rate, dailyRate) {
   const ms = new Date(endISO) - new Date(startISO);
   let minutes = Math.max(0, Math.ceil(ms / 60000));
@@ -184,8 +173,6 @@ function publicConfig() {
   const { managerPin, ...rest } = db.config;
   return rest;
 }
-
-// ---------- Routes publiques (Employé + Client) ----------
 
 app.get('/api/state', (req, res) => {
   expireStale();
@@ -272,8 +259,6 @@ app.get('/api/billing-preview', (req, res) => {
   const billing = computeBilling(b.startTime, new Date().toISOString(), b.rate, b.dailyRate);
   res.json(billing);
 });
-
-// ---------- Routes Gérant (protégées par code) ----------
 
 app.post('/api/gerant/verify', (req, res) => {
   if (!checkPin(req, res)) return;
@@ -381,11 +366,6 @@ app.put('/api/config/ticket-validity', (req, res) => {
   saveData();
   res.json({ ok: true });
 });
-
-// ---------- Sauvegarde manuelle (export / restauration) ----------
-// Couche de protection indépendante de l'hébergeur : le gérant peut à tout
-// moment télécharger une copie complète des données, et la restaurer plus
-// tard si besoin (ex : changement d'hébergeur, incident).
 
 app.get('/api/admin/export', (req, res) => {
   if (!checkPin(req, res)) return;

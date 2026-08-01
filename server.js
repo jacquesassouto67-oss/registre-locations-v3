@@ -24,6 +24,7 @@ function defaultConfig() {
     centerName: 'Centre de loisirs',
     managerPin: '1234',
     ticketValidityMinutes: 20,
+    nextTicketNumber: 1,
     rooms: [
       { id: uid(), name: 'Salle A', rate: 2000, dailyRate: 10000 },
       { id: uid(), name: 'Salle B', rate: 2000, dailyRate: 10000 },
@@ -44,6 +45,9 @@ function loadLocalData() {
   return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 }
 
+// Au démarrage : on essaie d'abord de récupérer les données depuis JSONbin
+// (survit à un redéploiement ou un changement de machine), sinon on se
+// rabat sur le fichier local.
 async function loadData() {
   if (JSONBIN_ID && JSONBIN_KEY) {
     try {
@@ -78,6 +82,7 @@ function maybeDailyBackup() {
   }
 }
 
+// Garde les 30 dernières sauvegardes quotidiennes locales, supprime le reste.
 function cleanupOldBackups() {
   try {
     const files = fs.readdirSync(DATA_DIR)
@@ -104,6 +109,8 @@ async function syncToJsonBin() {
   }
 }
 
+// Écriture locale immédiate (rapide, ne bloque pas la réponse) + copie vers
+// JSONbin en arrière-plan + une sauvegarde datée locale une fois par jour.
 function saveData() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -129,6 +136,11 @@ function genCode() {
   return code;
 }
 
+// Facturation :
+// 1-70 min -> 1h pleine due
+// 71-130 min -> 2h pleines dues
+// 131-190 min -> 3h dues, remise de 20%
+// > 190 min -> tarif journalier de la salle
 function computeBilling(startISO, endISO, rate, dailyRate) {
   const ms = new Date(endISO) - new Date(startISO);
   let minutes = Math.max(0, Math.ceil(ms / 60000));
@@ -174,6 +186,8 @@ function publicConfig() {
   return rest;
 }
 
+// ---------- Routes publiques (Employé + Client) ----------
+
 app.get('/api/state', (req, res) => {
   expireStale();
   const today = new Date().toDateString();
@@ -194,15 +208,18 @@ app.post('/api/tickets', (req, res) => {
   }
   const now = new Date();
   const expires = new Date(now.getTime() + db.config.ticketValidityMinutes * 60000);
+  if (!db.config.nextTicketNumber) db.config.nextTicketNumber = 1;
+  const ticketNumber = db.config.nextTicketNumber;
+  db.config.nextTicketNumber = ticketNumber + 1;
   const booking = {
-    id: uid(), roomId, roomName: room.name, rate: room.rate, dailyRate: room.dailyRate || 0,
+    id: uid(), ticketNumber, roomId, roomName: room.name, rate: room.rate, dailyRate: room.dailyRate || 0,
     employeeId: emp.id, employeeName: emp.name, client: client || '(non précisé)',
     code: genCode(), ticketIssuedAt: now.toISOString(), ticketExpiresAt: expires.toISOString(),
     startTime: null, endTime: null, status: 'en_attente', amount: null, billingLabel: null,
     paid: false, paymentMethod: null, closedByName: null, cancelReason: null,
     createdAt: now.toISOString(), updatedAt: now.toISOString(), history: [],
   };
-  addHistory(booking, emp.name, 'emission_ticket', `Salle ${room.name}, client ${booking.client}, valable jusqu'à ${expires.toLocaleTimeString('fr-FR')}`);
+  addHistory(booking, emp.name, 'emission_ticket', `Ticket #${String(ticketNumber).padStart(4, '0')} — Salle ${room.name}, client ${booking.client}, valable jusqu'à ${expires.toLocaleTimeString('fr-FR')}`);
   db.bookings.push(booking);
   saveData();
   res.json(booking);
@@ -259,6 +276,8 @@ app.get('/api/billing-preview', (req, res) => {
   const billing = computeBilling(b.startTime, new Date().toISOString(), b.rate, b.dailyRate);
   res.json(billing);
 });
+
+// ---------- Routes Gérant (protégées par code) ----------
 
 app.post('/api/gerant/verify', (req, res) => {
   if (!checkPin(req, res)) return;
@@ -367,6 +386,11 @@ app.put('/api/config/ticket-validity', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Sauvegarde manuelle (export / restauration) ----------
+// Couche de protection indépendante de l'hébergeur : le gérant peut à tout
+// moment télécharger une copie complète des données, et la restaurer plus
+// tard si besoin (ex : changement d'hébergeur, incident).
+
 app.get('/api/admin/export', (req, res) => {
   if (!checkPin(req, res)) return;
   const filename = `registre-locations-backup-${new Date().toISOString().slice(0, 10)}.json`;
@@ -389,5 +413,6 @@ app.post('/api/admin/import', (req, res) => {
 const PORT = process.env.PORT || 3000;
 (async () => {
   db = await loadData();
+  if (!db.config.nextTicketNumber) db.config.nextTicketNumber = 1;
   app.listen(PORT, () => console.log(`Registre des locations démarré sur le port ${PORT}`));
 })();

@@ -9,6 +9,7 @@ let state = {
   managerPin: null, // gardé en mémoire seulement après vérification
   clientMsg: null,
   clientActiveBookingId: null,
+  caisseDate: new Date().toISOString().slice(0, 10),
 };
 
 async function api(path, opts) {
@@ -108,12 +109,12 @@ function endBookingFlow(bookingId) {
 
 async function confirmEnd(bookingId, employeeId, paid, paymentMethod) {
   try {
-    await api(`/api/bookings/${bookingId}/end`, {
+    const finished = await api(`/api/bookings/${bookingId}/end`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ employeeId, paid, paymentMethod }),
     });
-    closeModal();
-    await refreshAndRender();
+    await loadState();
+    openModal('receipt', { booking: finished });
   } catch (e) { alert(e.message); }
 }
 
@@ -325,7 +326,7 @@ function renderHeader() {
 
 function renderTabs() {
   const tabsEmploye = [['salles', 'Salles'], ['historique', 'Historique du jour']];
-  const tabsGerant = [['salles', 'Salles'], ['historique', 'Historique'], ['rapports', 'Rapports'], ['journal', 'Journal'], ['config', 'Configuration']];
+  const tabsGerant = [['salles', 'Salles'], ['historique', 'Historique'], ['caisse', 'Clôture de caisse'], ['rapports', 'Rapports'], ['journal', 'Journal'], ['config', 'Configuration']];
   const tabs = state.mode === 'gerant' ? tabsGerant : tabsEmploye;
   return `<div class="tabs">${tabs.map(([id, label]) => `<button class="tab ${state.tab === id ? 'active' : ''}" data-tab="${id}">${label}</button>`).join('')}</div>`;
 }
@@ -333,6 +334,7 @@ function renderTabs() {
 function renderTabContent() {
   if (state.tab === 'salles') return renderSalles();
   if (state.tab === 'historique') return renderHistorique();
+  if (state.tab === 'caisse' && state.mode === 'gerant') return renderCaisse();
   if (state.tab === 'rapports' && state.mode === 'gerant') return renderRapports();
   if (state.tab === 'journal' && state.mode === 'gerant') return renderJournal();
   if (state.tab === 'config' && state.mode === 'gerant') return renderConfig();
@@ -366,7 +368,7 @@ function roomsGrid() {
       <div class="room-card pending">
         <div class="rname">${escapeHtml(room.name)}</div>
         <div class="rrate">${formatMoney(room.rate)} / heure</div>
-        <div class="status-pill wait">Ticket en attente</div>
+        <div class="status-pill wait">Ticket #${String(b.ticketNumber || '-').padStart(4, '0')} en attente</div>
         <div class="code-display">${b.code}</div>
         <div class="meta-line">Client : ${escapeHtml(b.client)}</div>
         <div class="meta-line">Émis par ${escapeHtml(b.employeeName)} — expire à ${formatTimeOnly(b.ticketExpiresAt)}</div>
@@ -381,7 +383,7 @@ function roomsGrid() {
       <div class="room-card occupied">
         <div class="rname">${escapeHtml(room.name)}</div>
         <div class="rrate">${formatMoney(room.rate)} / heure</div>
-        <div class="status-pill busy">Occupée</div>
+        <div class="status-pill busy">Occupée — Ticket #${String(b.ticketNumber || '-').padStart(4, '0')}</div>
         <div class="timer" data-timer="${b.startTime}">${formatClock(elapsed)}</div>
         <div class="amount-preview" data-preview="${b.startTime}|${b.rate}|${b.dailyRate || 0}">${preview.label} — ${formatMoney(preview.amount)}</div>
         <div class="meta-line">Client : ${escapeHtml(b.client)}</div>
@@ -410,11 +412,12 @@ function renderHistorique() {
     : todaysBookings();
   if (list.length === 0) return `<div class="empty">Aucune location terminée pour l'instant.</div>`;
   return `<table><thead><tr>
-      <th>Salle</th><th>Client</th><th>Employé (ticket)</th><th>Employé (fin)</th>
+      <th>Ticket</th><th>Salle</th><th>Client</th><th>Employé (ticket)</th><th>Employé (fin)</th>
       <th>Début (code activé)</th><th>Fin</th><th>Facturation</th><th>Montant</th><th>Statut</th>${state.mode === 'gerant' ? '<th>Actions</th>' : ''}
     </tr></thead><tbody>
     ${list.map(b => `
       <tr>
+        <td class="num">#${String(b.ticketNumber || '-').padStart(4, '0')}</td>
         <td>${escapeHtml(b.roomName)}</td>
         <td>${escapeHtml(b.client)}</td>
         <td>${escapeHtml(b.employeeName)}</td>
@@ -425,12 +428,67 @@ function renderHistorique() {
         <td class="num">${b.amount != null ? formatMoney(b.amount) : '-'}</td>
         <td>${statusTag(b)}</td>
         ${state.mode === 'gerant' ? `<td>
+            ${b.status === 'terminee' ? `<button class="btn ghost small" data-act="print-receipt" data-booking="${b.id}">🖨️ Reçu</button>` : ''}
             ${b.status === 'terminee' ? `<button class="btn ghost small" data-act="toggle-paid" data-booking="${b.id}">${b.paid ? 'Marquer non payé' : 'Marquer payé'}</button>` : ''}
             ${b.status === 'terminee' ? `<button class="btn danger small" data-act="cancel-open" data-booking="${b.id}">Annuler</button>` : ''}
           </td>` : ''}
       </tr>
     `).join('')}
   </tbody></table>`;
+}
+
+function renderCaisse() {
+  const dayBookings = state.bookings.filter(b => b.status === 'terminee' && b.endTime && b.endTime.slice(0, 10) === state.caisseDate);
+  const totalGeneral = dayBookings.reduce((s, b) => s + (b.amount || 0), 0);
+  const byMethod = {};
+  dayBookings.forEach(b => {
+    const m = b.paymentMethod || 'Non précisé';
+    byMethod[m] = (byMethod[m] || 0) + (b.amount || 0);
+  });
+  const byEmployee = {};
+  dayBookings.forEach(b => {
+    const key = b.closedByName || b.employeeName;
+    byEmployee[key] = byEmployee[key] || { count: 0, total: 0, especes: 0, mobile: 0, autre: 0, impaye: 0 };
+    byEmployee[key].count++;
+    byEmployee[key].total += (b.amount || 0);
+    if (!b.paid) byEmployee[key].impaye += (b.amount || 0);
+    else if (b.paymentMethod === 'Espèces') byEmployee[key].especes += (b.amount || 0);
+    else if (b.paymentMethod === 'Mobile Money') byEmployee[key].mobile += (b.amount || 0);
+    else byEmployee[key].autre += (b.amount || 0);
+  });
+  const unpaid = dayBookings.filter(b => !b.paid).reduce((s, b) => s + (b.amount || 0), 0);
+
+  return `
+    <div class="config-block" style="margin-bottom:18px">
+      <div class="field" style="margin-bottom:0">
+        <label>Journée</label>
+        <input type="date" id="caisse-date" value="${state.caisseDate}">
+      </div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="label">Locations clôturées</div><div class="value">${dayBookings.length}</div></div>
+      <div class="stat-card"><div class="label">Total encaissé</div><div class="value">${formatMoney(totalGeneral)}</div></div>
+      <div class="stat-card ${unpaid > 0 ? 'alert' : ''}"><div class="label">Dont impayé</div><div class="value">${formatMoney(unpaid)}</div></div>
+    </div>
+    <div class="section-title">Répartition par mode de paiement</div>
+    <table><thead><tr><th>Mode de paiement</th><th>Montant</th></tr></thead>
+    <tbody>${Object.entries(byMethod).map(([m, amt]) => `<tr><td>${escapeHtml(m)}</td><td class="num">${formatMoney(amt)}</td></tr>`).join('') || '<tr><td colspan="2" style="text-align:center;color:var(--ink-soft)">Aucune donnée pour cette date</td></tr>'}</tbody></table>
+    <div class="section-title">Détail par employé (celui qui a clôturé)</div>
+    <table><thead><tr><th>Employé</th><th>Locations</th><th>Espèces</th><th>Mobile Money</th><th>Autre</th><th>Impayé</th><th>Total</th></tr></thead>
+    <tbody>${Object.entries(byEmployee).map(([name, d]) => `
+      <tr>
+        <td>${escapeHtml(name)}</td>
+        <td class="num">${d.count}</td>
+        <td class="num">${formatMoney(d.especes)}</td>
+        <td class="num">${formatMoney(d.mobile)}</td>
+        <td class="num">${formatMoney(d.autre)}</td>
+        <td class="num" style="${d.impaye > 0 ? 'color:var(--alert)' : ''}">${formatMoney(d.impaye)}</td>
+        <td class="num">${formatMoney(d.total)}</td>
+      </tr>
+    `).join('') || '<tr><td colspan="7" style="text-align:center;color:var(--ink-soft)">Aucune donnée pour cette date</td></tr>'}</tbody></table>
+    <div class="hint" style="margin-top:10px">Le total "Espèces" est celui à retrouver physiquement en caisse pour cette journée. Comparez-le avec l'argent réellement compté à la clôture.</div>
+    <div style="margin-top:14px"><button class="btn ghost small" data-act="print-caisse">🖨️ Imprimer ce rapport</button></div>
+  `;
 }
 
 function renderRapports() {
@@ -592,8 +650,9 @@ function renderModal() {
   }
   if (type === 'ticket-created') {
     const b = payload.booking;
-    return modalWrap(`Ticket émis — ${escapeHtml(b.roomName)}`, `
+    return modalWrap(`Ticket #${String(b.ticketNumber || '-').padStart(4, '0')} émis — ${escapeHtml(b.roomName)}`, `
       <div style="text-align:center">
+        <div class="hint" style="font-family:var(--mono);font-size:13px;margin-bottom:6px">Ticket N° ${String(b.ticketNumber || '-').padStart(4, '0')}</div>
         <div class="code-display" style="font-size:36px">${b.code}</div>
         <div class="hint" style="margin-top:6px">Remettez ce code à ${escapeHtml(b.client)}. Il devra le saisir dans l'Espace client à son arrivée dans la salle. Valable jusqu'à ${formatTimeOnly(b.ticketExpiresAt)}.</div>
       </div>
@@ -627,6 +686,17 @@ function renderModal() {
       <div class="modal-actions">
         <button class="btn ghost" data-act="close-modal">Retour</button>
         <button class="btn danger" data-act="submit-cancel" data-booking="${payload.bookingId}">Confirmer l'annulation</button>
+      </div>
+    `);
+  }
+  if (type === 'receipt') {
+    const b = payload.booking;
+    return modalWrap(`Location terminée — Ticket #${String(b.ticketNumber || '-').padStart(4, '0')}`, `
+      <div class="hint" style="margin-bottom:10px">${escapeHtml(b.billingLabel || '')} — <b>${formatMoney(b.amount)}</b> — ${b.paid ? 'Payé' : 'Non payé'} (${escapeHtml(b.paymentMethod || '-')})</div>
+      <div class="hint">Vous pouvez imprimer un reçu pour le client.</div>
+      <div class="modal-actions">
+        <button class="btn ghost" data-act="close-modal">Fermer</button>
+        <button class="btn" data-act="print-receipt" data-booking="${b.id}">🖨️ Imprimer le reçu</button>
       </div>
     `);
   }
@@ -668,10 +738,84 @@ function renderClientView() {
 function escapeHtml(s) { return String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
 function escapeAttr(s) { return escapeHtml(s); }
 
+function printHtmlDocument(title, bodyHtml) {
+  const w = window.open('', '_blank', 'width=420,height=600');
+  if (!w) { alert("L'impression a été bloquée par le navigateur. Autorisez les pop-ups pour ce site et réessayez."); return; }
+  w.document.write(`
+    <!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>${title}</title>
+    <style>
+      body{font-family:'Courier New',monospace;font-size:13px;color:#111;padding:16px;max-width:340px;margin:0 auto;}
+      h1{font-size:16px;text-align:center;margin:0 0 4px;}
+      .sub{text-align:center;font-size:11px;color:#555;margin-bottom:14px;}
+      .line{border-top:1px dashed #999;margin:10px 0;}
+      table{width:100%;border-collapse:collapse;font-size:12px;}
+      td{padding:3px 0;vertical-align:top;}
+      td.label{color:#555;}
+      td.val{text-align:right;font-weight:bold;}
+      .total{font-size:15px;margin-top:10px;}
+      .center{text-align:center;}
+    </style>
+    </head><body>${bodyHtml}</body></html>
+  `);
+  w.document.close();
+  w.focus();
+  setTimeout(() => w.print(), 250);
+}
+
+function printReceipt(b) {
+  const html = `
+    <h1>${escapeHtml(state.config.centerName)}</h1>
+    <div class="sub">Reçu de location — Ticket #${String(b.ticketNumber || '-').padStart(4, '0')}</div>
+    <div class="line"></div>
+    <table>
+      <tr><td class="label">Salle</td><td class="val">${escapeHtml(b.roomName)}</td></tr>
+      <tr><td class="label">Client</td><td class="val">${escapeHtml(b.client)}</td></tr>
+      <tr><td class="label">Début</td><td class="val">${formatDT(b.startTime)}</td></tr>
+      <tr><td class="label">Fin</td><td class="val">${formatDT(b.endTime)}</td></tr>
+      <tr><td class="label">Facturation</td><td class="val">${escapeHtml(b.billingLabel || '')}</td></tr>
+      <tr><td class="label">Paiement</td><td class="val">${escapeHtml(b.paymentMethod || '-')}</td></tr>
+      <tr><td class="label">Statut</td><td class="val">${b.paid ? 'Payé' : 'Non payé'}</td></tr>
+    </table>
+    <div class="line"></div>
+    <table><tr><td class="label total">Montant</td><td class="val total">${formatMoney(b.amount)}</td></tr></table>
+    <div class="line"></div>
+    <div class="center sub">Servi par ${escapeHtml(b.closedByName || b.employeeName)}<br>${formatDT(new Date().toISOString())}</div>
+  `;
+  printHtmlDocument(`Reçu #${b.ticketNumber || ''}`, html);
+}
+
+function printCaisseReport() {
+  const dayBookings = state.bookings.filter(b => b.status === 'terminee' && b.endTime && b.endTime.slice(0, 10) === state.caisseDate);
+  const total = dayBookings.reduce((s, b) => s + (b.amount || 0), 0);
+  const byMethod = {};
+  dayBookings.forEach(b => { const m = b.paymentMethod || 'Non précisé'; byMethod[m] = (byMethod[m] || 0) + (b.amount || 0); });
+  const rows = dayBookings.map(b => `
+    <tr><td class="label">#${String(b.ticketNumber || '-').padStart(4, '0')} ${escapeHtml(b.roomName)}</td><td class="val">${formatMoney(b.amount)}</td></tr>
+  `).join('');
+  const methodRows = Object.entries(byMethod).map(([m, amt]) => `<tr><td class="label">${escapeHtml(m)}</td><td class="val">${formatMoney(amt)}</td></tr>`).join('');
+  const html = `
+    <h1>${escapeHtml(state.config.centerName)}</h1>
+    <div class="sub">Clôture de caisse — ${state.caisseDate}</div>
+    <div class="line"></div>
+    <table>${rows || '<tr><td colspan="2" class="center">Aucune location</td></tr>'}</table>
+    <div class="line"></div>
+    <table>${methodRows}</table>
+    <div class="line"></div>
+    <table><tr><td class="label total">Total</td><td class="val total">${formatMoney(total)}</td></tr></table>
+    <div class="line"></div>
+    <div class="center sub">Édité le ${formatDT(new Date().toISOString())}</div>
+  `;
+  printHtmlDocument(`Cloture de caisse ${state.caisseDate}`, html);
+}
+
 function attachHandlers() {
   document.querySelectorAll('[data-tab]').forEach(el => {
     el.onclick = () => { state.tab = el.dataset.tab; render(); };
   });
+  const caisseDateInput = document.getElementById('caisse-date');
+  if (caisseDateInput) {
+    caisseDateInput.onchange = () => { state.caisseDate = caisseDateInput.value; render(); };
+  }
   document.querySelectorAll('[data-act]').forEach(el => {
     el.onclick = async (ev) => {
       const act = el.dataset.act;
@@ -681,6 +825,11 @@ function attachHandlers() {
       else if (act === 'exit-gerant') exitGerant();
       else if (act === 'open-client') openClientView();
       else if (act === 'close-client') closeClientView();
+      else if (act === 'print-caisse') printCaisseReport();
+      else if (act === 'print-receipt') {
+        const b = state.bookings.find(x => x.id === el.dataset.booking);
+        if (b) printReceipt(b);
+      }
       else if (act === 'submit-client-code') {
         const val = document.getElementById('client-code-input').value;
         await submitClientCode(val);
